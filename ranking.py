@@ -145,7 +145,6 @@ class Subset(nn.Module):
                  noised_fraction: float = 0.1,
                  stddev_factor: float = 4.0,
                  use_random_rank: bool = True,
-                 noise_bias: bool = True,
                  random_fraction: FloatLike = 0.1):
         """
         Selects a subset of the input embeddings (the size of the subset is
@@ -165,8 +164,6 @@ class Subset(nn.Module):
         super().__init__()
         self.to_scores = nn.Linear(num_channels, 1)
         self.noised_fraction = noised_fraction
-        if noise_bias:
-            self.noise_bias = nn.Parameter(torch.zeros(num_channels))
         self.sort = Sort(stddev_factor=stddev_factor, use_random_rank=use_random_rank)
         self.random_fraction = random_fraction
 
@@ -211,8 +208,7 @@ class Subset(nn.Module):
         noise_scale = noise_scale * ((x ** 2).mean(dim=2, keepdim=True) + eps) ** 0.5
 
         y = (x * x_scale) + (torch.randn_like(x) * noise_scale)
-        if hasattr(self, 'noise_bias'):
-            y = y + self.noise_bias
+
         return indexes, y, x_scale
 
 
@@ -242,7 +238,7 @@ class Subset(nn.Module):
 
 def _test_sort_numbers():
     num_channels = 128
-    model = Subset(num_channels=num_channels, noise_bias=False)
+    model = Subset(num_channels=num_channels)
     model.train()
     optim = torch.optim.Adam(model.parameters(), lr=2e-04)
 
