@@ -13,6 +13,7 @@ except:
 
 
 class Sort(nn.Module):
+    # this has no parameters, only configurations.
     def __init__(self,
                  stddev_factor: float = 1.0,
                  use_random_rank: bool = True):
@@ -139,7 +140,120 @@ class Sort(nn.Module):
         print(f"upper_clamped={upper_clamp}, lower_clamped={lower_clamp}, diffs largest={diff_values[:,-1]} vs. stddev {stddev}, largest_indexes={largest_indexes}, diffs mean={diff_values.mean()}")
 
 
-class Subset(nn.Module):
+def _randomize_some(x: Tensor, random_fraction: float) -> Tensor:
+    """
+    Randomizes a fraction of the elements of x (scores) by replacing them with other elements
+    """
+    if random_fraction == 0.0:
+        return
+    mask = torch.rand_like(x) < random_fraction  # True for things we'll replace.
+    batch_mask = torch.rand_like(x[:, :1]) < 0.75
+    mask = torch.logical_and(mask, batch_mask)
+    # for 25% of batch elements, don't do randomization, so the model learns to deal with
+    # the test-time condition where there is no randomization.
+
+    x_rand = x.flip(dims=(0,1))
+    # for the elements where 'mask' is true, return x_rand, which is from a
+    # pseudo-random location, if it's larger than x; otherwise, return x.
+    # we'll never let the randomization turn things *off* only on, hence the
+    # "max".
+    return torch.where(mask, torch.max(x, x_rand), x)
+
+
+
+
+class SubsetItems(nn.Module):
+    # This has no parameters, only configurations.  Unlike Subset, it does not
+    # output embeddings from its forward function.
+    def __init__(self,
+                 noised_fraction: float = 0.1,
+                 stddev_factor: float = 4.0,
+                 use_random_rank: bool = True,
+                 random_fraction: FloatLike = 0.1):
+        """
+        Selects a subset of indexes based on the input scores, with weights;
+        and provides a function to add the appropriate amount of noise to
+        input embeddings.
+
+        specified in forward().  Those near the boundary are replaced with noise.
+
+        Args:
+              noised_fraction: the fraction of the input embeddings that have
+                noise added to them; a too-small value will make the gradients
+                too peaky and things prior to this module harder to learn.
+          random_fraction: the fraction of scores that are to be from random
+            locations, in training mode.  We will only apply random_fraction for 75%
+            of the time (decided per batch-element), so that it learns to be compatible
+            with test time when random_fraction is not applied.  The purpose of this is
+            to help training get started.
+        """
+        super().__init__()
+        self.noised_fraction = noised_fraction
+        self.sort = Sort(stddev_factor=stddev_factor, use_random_rank=use_random_rank)
+        self.random_fraction = random_fraction
+
+    def forward(self,
+                scores: Tensor,
+                N: int) -> Tuple[Tensor, Tensor]:
+        """
+        Forward function that selects items with the highest scores and returns indexes
+        and weights (the weights must be used, e.g. to control interpolation with noise,
+        to provide derivatives to learn from).
+       Args:
+
+          scores: the scores, of shape (batch_size, num_items)  ("num_items" just
+             means the number of items to select from).
+
+           N: the number of items from 'num_items' to keep.
+
+        Returns: (index, weight), where:
+             index:  (batch_size, N), the indexes of the chosen items
+             weight: (batch_size, N), weights between 0 and 1 that will
+                    only be != 1 for a fraction "noised_fraction" of the weights.
+        """
+        (batch_size, num_items) = scores.shape
+
+        if self.training:
+            scores = _randomize_some(scores, float(self.random_fraction))
+        # scores: (batch_size, num_items)
+
+        assert N <= num_items
+
+        indexes, ranks = self.sort(scores)
+        # indexes, ranks: (batch_size, num_items)
+        # indexes are integers that index the embedding dimension
+        # ranks are [0.0, 1.0, 2.0... ], but differentiable.
+
+        indexes = indexes[:, -N:]
+
+        # add noise.  For now, do this even in test mode, in case the model comes to rely on.
+        num_discarded = num_items - N
+        weight = ((ranks[:, -N:] - num_discarded) / (self.noised_fraction * N)).clamp(max=1.0)
+
+        return indexes, weight
+
+    def add_noise(self, emb: Tensor, weight: Tensor) -> Tensor:
+        """
+        Interpolates "emb" with noise for items where "weight" is less than
+        one.  This is done in order to ensure differentiability.
+        Args:
+            emb: (batch_size, num_emb, num_channels)
+         weight: (batch_size, num_emb)
+        """
+        (batch_size, num_emb, num_channels) = emb.shape
+        weight = weight.unsqueeze(-1)
+        eps = 1.0e-05
+        noise_scale = 1.0 - weight
+        # include the rms of each embedding vector in noise_scale, to avoid x learning to
+        # get large to defeat th enoise.
+        noise_scale = noise_scale * ((emb ** 2).mean(dim=2, keepdim=True) + eps) ** 0.5
+        return (emb * weight) + (torch.randn_like(emb) * noise_scale)
+
+
+
+
+
+class SubsetEmbeddings(nn.Module):
     def __init__(self,
                  num_channels: int,
                  noised_fraction: float = 0.1,
@@ -163,82 +277,40 @@ class Subset(nn.Module):
         """
         super().__init__()
         self.to_scores = nn.Linear(num_channels, 1)
-        self.noised_fraction = noised_fraction
-        self.sort = Sort(stddev_factor=stddev_factor, use_random_rank=use_random_rank)
-        self.random_fraction = random_fraction
+        self.subset_items = SubsetItems(noised_fraction=noised_fraction,
+                                        stddev_factor=stddev_factor,
+                                        use_random_rank=use_random_rank,
+                                        random_fraction=random_fraction)
+
 
     def forward(self,
                 x: Tensor,
                 N: int) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        Forward function that selects some elements of x.  Args:
+        Forward function that selects some elements of the embeddings x.  Args:
           x: the embeddings to select from, of shape (batch_size, num_embeddings, num_channels))
            N: the number of embeddings from 'num_embeddings' to keep.
 
-        Returns: (indexes, y, weights), where:
-             indexes: (batch_size, N), the indexes of the chosen embeddings
-                   y: (batch_size, N, num_channels), the selected features
-             weights: (batch_size, N, 1), weights between 0 and 1 that will
+        Returns: (y, index, weight), where:
+                 y: (batch_size, N, num_channels), the selected features
+             index: (batch_size, N), the indexes of the chosen embeddings
+            weight: (batch_size, N), weights between 0 and 1 that will
                     only be != 1 for a fraction "noised_fraction" of the weights.
         """
-        (batch_size, num_embeddings, num_channels) = x.shape
-        x = self.to_scores(x).squeeze(-1)
-        if self.training:
-            x = self._randomize_some(x)
-        # scores: (batch_size, num_embeddings)
 
-        indexes, ranks = self.sort(scores)
-        # indexes, ranks: (batch_size, num_embeddings)
-        # indexes are integers that index the embedding dimension
-        # ranks are [0.0, 1.0, 2.0... ], but differentiable.
+        scores = self.to_scores(x).squeeze(-1)
+        index, weight = self.subset_items(scores, N)
 
-        indexes = indexes[:, -N:]
-
-        x = torch.gather(x, dim=1, index=indexes.unsqueeze(-1).expand(batch_size, N, num_channels))
-
-        # add noise.  For now, do this even in test mode, in case the model comes to rely on.
-        num_discarded = num_embeddings - N
-        x_scale = ((ranks[:, -N:].unsqueeze(-1) - num_discarded) / (self.noised_fraction * N)).clamp(max=1.0)
-        # x_scale: (batch_size, N, 1)
-        noise_scale = 1.0 - x_scale
-
-        eps = 1.0e-05
-        # include the rms of each embedding vector in noise_scale, to avoid x learning to
-        # get large to defeat th enoise.
-        noise_scale = noise_scale * ((x ** 2).mean(dim=2, keepdim=True) + eps) ** 0.5
-
-        y = (x * x_scale) + (torch.randn_like(x) * noise_scale)
-
-        return indexes, y, x_scale
-
-
-
-    def _randomize_some(self, x: Tensor) -> Tensor:
-        """
-        Randomizes a fraction of the elements of x (scores) by replacing them with other elements
-        """
-        random_fraction = float(self.random_fraction)
-        if random_fraction == 0.0:
-            return
-        mask = torch.rand_like(x) < random_fraction  # True for things we'll replace.
-        batch_mask = torch.rand_like(x[:, :1]) < 0.75
-        mask = torch.logical_and(mask, batch_mask)
-        # for 25% of batch elements, don't do randomization, so the model learns to deal with
-        # the test-time condition where there is no randomization.
-
-        x_rand = x.flip(dims=(0,1))
-        # for the elements where 'mask' is true, return x_rand, which is from a
-        # pseudo-random location, if it's larger than x; otherwise, return x.
-        # we'll never let the randomization turn things *off* only on, hence the
-        # "max".
-        return torch.where(mask, torch.max(x, x_rand), x)
+        x = torch.gather(x, dim=1, index=index[..., None].expand(index.shape[0], index.shape[1], x.shape[2]))
+        x = self.subset_items.add_noise(x, weight)
+        return x, index, weight
 
 
 
 
-def _test_sort_numbers():
+def _test_sort_emb():
     num_channels = 128
-    model = Subset(num_channels=num_channels)
+    model = SubsetEmbeddings(num_channels=num_channels)
     model.train()
     optim = torch.optim.Adam(model.parameters(), lr=2e-04)
 
@@ -249,7 +321,7 @@ def _test_sort_numbers():
 
         x = torch.randn(batch_size, num_embeddings, num_channels)
 
-        _indexes, y, _weights = model(x, N)
+        y, _indexes, _weights = model(x, N)
 
         # want the N largest elements of the 1st dim of x
         loss = - y[..., 0].sum()
@@ -264,7 +336,7 @@ def _test_sort_numbers():
 
             # get loss in eval mode
             model.eval()
-            _indexes, y, _weights = model(x, N)
+            y, _indexes, _weights = model(x, N)
             model.train()
             # want the N largest elements of the 1st dim of x
             loss_eval = - y[..., 0].sum()
@@ -276,4 +348,4 @@ def _test_sort_numbers():
 
 
 if __name__ == '__main__':
-    _test_sort_numbers()
+    _test_sort_emb()
