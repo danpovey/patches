@@ -156,7 +156,7 @@ class Subset(nn.Module):
               noised_fraction: the fraction of the input embeddings that have
                 noise added to them; a too-small value will make the gradients
                 too peaky and things prior to this module harder to learn.
-          random_fraction: the fraction of scores that are to be in random
+          random_fraction: the fraction of scores that are to be from random
             locations, in training mode.  We will only apply random_fraction for 75%
             of the time (decided per batch-element), so that it learns to be compatible
             with test time when random_fraction is not applied.  The purpose of this is
@@ -175,7 +175,7 @@ class Subset(nn.Module):
                 N: int) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward function that selects some elements of x.  Args:
-          x: the embeddings to select from, of shape (batch_size, num_embeddings, num_channels)
+          x: the embeddings to select from, of shape (batch_size, num_embeddings, num_channels))
            N: the number of embeddings from 'num_embeddings' to keep.
 
         Returns: (indexes, y, weights), where:
@@ -185,9 +185,9 @@ class Subset(nn.Module):
                     only be != 1 for a fraction "noised_fraction" of the weights.
         """
         (batch_size, num_embeddings, num_channels) = x.shape
+        x = self.to_scores(x).squeeze(-1)
         if self.training:
             x = self._randomize_some(x)
-        scores = self.to_scores(x).squeeze(-1)
         # scores: (batch_size, num_embeddings)
 
         indexes, ranks = self.sort(scores)
@@ -230,11 +230,12 @@ class Subset(nn.Module):
         # for 25% of batch elements, don't do randomization, so the model learns to deal with
         # the test-time condition where there is no randomization.
 
-        x_rand = x.flip(dims=(0,1)).detach()
-        # for the elements where 'mask' is true, return x_rand which is flipped and detached x;
-        # otherwise, return x.
-        return torch.where(mask, x_rand, x)
-
+        x_rand = x.flip(dims=(0,1))
+        # for the elements where 'mask' is true, return x_rand, which is from a
+        # pseudo-random location, if it's larger than x; otherwise, return x.
+        # we'll never let the randomization turn things *off* only on, hence the
+        # "max".
+        return torch.where(mask, torch.max(x, x_rand), x)
 
 
 
