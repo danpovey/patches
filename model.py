@@ -280,6 +280,8 @@ class MultiscaleVisionModel(nn.Module):
                                                                                   w_offset)
 
             if True:
+                # this block is all debug.  pyplot may not be the best way to display things,
+                # I was running this code on desktop.
                 print("Encoder output:")
                 self.visualize_from_decoder(encoder_output_emb, encoder_index, _encoder_weights)
                 print("Decoder output:")
