@@ -85,7 +85,11 @@ class SubsetPatchEmbeddings(nn.Module):
         (batch_size, num_emb, patches_per_toplevel_patch) = scores.shape
         scores = scores.reshape(batch_size, num_emb * patches_per_toplevel_patch)
         emb_indexes = (torch.arange(num_emb * patches_per_toplevel_patch, device=emb.device) //
-                       patches_per_toplevel_patch)  # indexes into 'x' that give us the top-level patch
+                       patches_per_toplevel_patch)
+        # emb_indexes are the indexes into 'indexes_toplevel' that, for each
+        # patch in 'patch_indexes', gives us the top-level patch to which it
+        # belongs.  This is based on knowledge of how the patches are
+        # interpspersed by get_child_indexes().
         emb_indexes = emb_indexes.unsqueeze(0).expand(batch_size, num_emb * patches_per_toplevel_patch)
 
         # patch_indexes: (batch_size, num_emb * patches_per_toplevel_patch)
@@ -94,7 +98,8 @@ class SubsetPatchEmbeddings(nn.Module):
         index, weight = self.subset_items(scores, N)
         # index, weight: each (batch_size, N)
 
-        # gather the chosen subsets.
+        # for each chosen index in 'index', we want the index into 'emb'
+        # that will give us the embedding corresponding to its top-level patch.
         emb_indexes = torch.gather(emb_indexes, dim=1, index=index)
         # now emb_indexes: (batch_size, N)
         patch_indexes = torch.gather(patch_indexes, dim=1, index=index)
@@ -110,7 +115,7 @@ class SubsetPatchEmbeddings(nn.Module):
             x = x + m.forward_indexes(img, patch_indexes, h_offset, w_offset)
 
         x = self.subset_items.add_noise(x, weight)
-        return x, index, weight
+        return x, patch_indexes, weight
 
 
 
@@ -130,6 +135,8 @@ class MultiscaleVisionModel(nn.Module):
         # we add a channel to the image before giving it to the extractor, to be
         # the mask reflecting what part of the image, if any, is masked and we
         # are going to be doing MAE loss on that part.
+        self.max_size = max_size
+        self.num_levels = num_levels
         self.extractor = MultiscalePatchExtractor(img_channels + 1,
                                                   num_channels,
                                                   max_size,
@@ -273,12 +280,21 @@ class MultiscaleVisionModel(nn.Module):
                                                                                   w_offset)
 
             if True:
+                print("Encoder output:")
+                self.visualize_from_decoder(encoder_output_emb, encoder_index, _encoder_weights)
+                print("Decoder output:")
+                self.visualize_from_decoder(decoder_output_emb, decoder_index, decoder_weights)
+                print("Frontend output:")
+                self.visualize_from_decoder(frontend_emb, toplevel_indexes, torch.ones(*toplevel_indexes.shape,
+                                                                                  device=toplevel_indexes.device))
+
                 # Caution: when we visualize the patches below, we dont expect to
                 # see all the patches inside the visualized portion until the model is
                 # trained, because actually the chosen patches can be anywhere in the
                 print("encoder_weights = ", _img_encoder_weights)
-                enc_patches = _img_encoder_weights / _img_encoder_weights.max()
-                dec_patches = _img_decoder_weights / _img_decoder_weights.max()
+                scale = 1.0 / sum([ 4**n for n in range(self.num_levels) ])
+                enc_patches = (_img_encoder_weights * scale).sqrt().expand_as(x)
+                dec_patches = (_img_decoder_weights * scale).sqrt().expand_as(x)
                 decoder_img = (img_recon_decoder + 1) * 0.5  # not really sure about this formula
                 input_img = (x + 1) * 0.5
                 import matplotlib.pyplot as plt
@@ -310,6 +326,27 @@ class MultiscaleVisionModel(nn.Module):
                 classification_loss_encoder,
                 mae_loss_frontend,
                 mae_loss_decoder)
+
+
+    def visualize_from_decoder(self,
+                               emb: Tensor,
+                               index: Tensor,
+                               weights: Tensor):
+
+        img_recon_decoder, img_decoder_weights = self.reconstructor_decoder(emb, index, weights,
+                                                                            img_size=self.max_size)
+
+        img_decoder_weights = img_decoder_weights.expand_as(img_recon_decoder)
+        img_decoder_weights = img_decoder_weights / sum([ 4 ** n for n in range(self.reconstructor_decoder.num_levels) ])
+        img_decoder_weights = img_decoder_weights.sqrt()
+
+        import matplotlib.pyplot as plt
+        img = torch.cat((img_recon_decoder, img_decoder_weights), dim=2)
+        img = img.reshape(-1, img.shape[2], img.shape[3])  # combine height with batch.
+        img = (img + 1) * 0.5
+        plt.imshow(img.detach(), cmap='hot', interpolation='nearest')
+        plt.show()
+
 
 
 
