@@ -3,7 +3,7 @@ from torch import nn
 from torch import Tensor
 from typing import Tuple, Optional
 import random
-from ranking import Subset
+from ranking import SubsetEmbeddings
 
 try:
     from scaling import FloatLike
@@ -280,7 +280,7 @@ class PatchExtractor(nn.Module):
         max_npatches = self.num_patches
         img_npatches = (img_height // patch_h, img_width // patch_w)
         if h_offset is not None:
-            if random.random() < 0.01:
+            if __name__ == '__main__' or random.random() < 0.01:
                 assert torch.all(h_offset % patch_h == 0)
                 assert torch.all(w_offset % patch_w == 0)
             h_offset = h_offset // patch_h
@@ -398,8 +398,12 @@ class ImageReconstructor(nn.Module):
         batch_size = emb.shape[0]
 
         if h_offset is not None:
+            if __name__ == '__main__' or random.random() < 0.01:
+                assert torch.all(h_offset % patch_h == 0)
+                assert torch.all(w_offset % patch_w == 0)
             h_offset = h_offset // patch_h
             w_offset = w_offset // patch_w
+
         patch_indexes = _get_patch_indexes(max_npatches, img_npatches,
                                            batch_size, h_offset, w_offset, emb.device)
 
@@ -437,13 +441,14 @@ class MultiscalePatchExtractor(nn.Module):
                  img_channels: int,
                  num_channels: int,
                  max_size: Tuple[int, int] = (512, 512),
-                 patch_size: Tuple[int, int] = (4,4),  # must be multiple of 2.
+                 patch_size: Tuple[int, int] = (4,4),  # smallest patch size; must be multiple of 2.
                  num_levels: int = 3,
                  max_patch_dim_factor: int = 2):
         super().__init__()
-        self.max_size = max_size
-        self.patch_size = patch_size
+        self.max_size = max_size      # max image size.
         self.num_levels = num_levels
+        self.largest_patch_size = (patch_size[0] * 2 ** (num_levels - 1),
+                                   patch_size[1] * 2 ** (num_levels - 1))
 
         def is_power_of_two(x):
             return (x & (x-1)) == 0
@@ -462,14 +467,14 @@ class MultiscalePatchExtractor(nn.Module):
         patch_dims = [ ]
         index_offsets = [ 0 ]
         for level in range(num_levels):
+            factor = 2 ** (num_levels - 1 - level)  # factor for patch size, vs. smallest.
             subsample = 1
-            while base_patch_dim * (4 ** level) / (subsample ** 2) > max_patch_dim:
+            while base_patch_dim * (factor // subsample) ** 2  > max_patch_dim:
                 subsample *= 2
-            two_l = 2 ** level
             subsample_factors.append(subsample)
             patch_extractors.append(PatchExtractor(img_channels, num_channels,
                                                    (max_size[0] // subsample, max_size[1] // subsample),
-                                                   (patch_size[0] * two_l // subsample, patch_size[1] * two_l // subsample)))
+                                                   (patch_size[0] * factor // subsample, patch_size[1] * factor // subsample)))
             # the "index_offsets" are offsets we add to the patch indexes
             # when combining multiple resolutions.
             index_offsets.append(index_offsets[-1] + patch_extractors[-1].num_indexes)
@@ -478,7 +483,6 @@ class MultiscalePatchExtractor(nn.Module):
         self.extractors = nn.ModuleList(patch_extractors)
         self.index_offsets = index_offsets
         self.subsample_factors = subsample_factors
-        print("subsample = ", subsample_factors)
 
 
     def num_indexes(self):
@@ -498,7 +502,7 @@ class MultiscalePatchExtractor(nn.Module):
 
         Args:
           x: the image, of shape (N, H, W, C).  Its (heightsize must be a multiple of
-              the largest patch size, i.e. of self.extractors[-1].patch_size
+              the largest patch size, i.e. of self.extractors[0].patch_size
           h_offset, w_offset: these represent the offset of image x within the
               "image template" of size self.max_size; they are mostly provided
               for purposes of augmentation, but may also be useful to extract
@@ -520,7 +524,7 @@ class MultiscalePatchExtractor(nn.Module):
         indexes = [ ]  # one tensor per level, shape: (N, num_embeddings)
         def _div(x, subsample):
             return x // subsample if x is not None else None
-        for level in range(self.num_levels - num_levels, self.num_levels):
+        for level in range(num_levels):
             s = self.subsample_factors[level]
             embed, idx = self.extractors[level](_subsample(x, s), _div(h_offset, s), _div(w_offset, s))
             embeddings.append(embed)
@@ -600,23 +604,19 @@ class MultiscalePatchExtractor(nn.Module):
         all_indexes = [ indexes ]
         # prev_indexes: (batch_size, num_indexes_in, 1); will always be: (batch_size, _, 1)
         prev_indexes = combined_indexes = indexes.unsqueeze(-1)
-        prev_offset = self.index_offsets[self.num_levels - 1]
-        prev_npatches = self.extractors[-1].num_patches
-        for level in range(self.num_levels - 2, -1, -1):  # e.g. (1, 0) if num_levels == 3.
-            this_offset = self.index_offsets[level]
-            this_npatches = (prev_npatches[0] * 2, prev_npatches[1] * 2)
+        for level in range(1, self.num_levels):  # e.g. (1, 2) if num_levels == 3.
+            this_npatches = self.extractors[level].num_patches
             # 'this_offsets' give the index offsets of the 4 patches in a 2x2 square, from the top-left
             # patch of the square.  this_npatches[1] is the width of the template image at this level;
             # it reflects that the patch_index is (x + y * width).
             this_offsets = torch.tensor([ 0, 1, this_npatches[1], this_npatches[1] + 1 ], device=indexes.device)
-            # the '* 2' reflects that all the x and y patch locations are twice larger each
-            # time we increase the resolution.
-            this_indexes = this_offset + (prev_indexes - prev_offset) * 2  # (batch_size, _, 1)
+            # the '* 2' reflects that all the x and y patch locations, and the width,
+            # are twice larger each time we increase the resolution, so all terms in the
+            # equation for position get multiplied by 2.
+            this_indexes = self.index_offsets[level] + (prev_indexes - self.index_offsets[level - 1]) * 2  # (batch_size, _, 1)
             this_indexes = (this_indexes.unsqueeze(-1) + this_offsets) # (batch_size, _, 4)
             all_indexes.append(this_indexes)
             prev_indexes = this_indexes.reshape(batch_size, -1, 1)
-            prev_offset = this_offset
-            prev_npatches = this_npatches
 
         # intersperse the indexes.
         while len(all_indexes) > 1:
@@ -661,14 +661,14 @@ class MultiscaleImageReconstructor(nn.Module):
         patch_dims = [ ]
         index_offsets = [ 0 ]
         for level in range(num_levels):
+            factor = 2 ** (num_levels - 1 - level)  # factor for patch size, vs. smallest.
             subsample = 1
-            while base_patch_dim * (4 ** level) / (subsample ** 2) > max_patch_dim:
+            while base_patch_dim * (factor // subsample) ** 2  > max_patch_dim:
                 subsample *= 2
-            two_l = 2 ** level
             subsample_factors.append(subsample)
             reconstructors.append(ImageReconstructor(img_channels, num_channels,
                                                     (max_size[0] // subsample, max_size[1] // subsample),
-                                                    (patch_size[0] * two_l // subsample, patch_size[1] * two_l // subsample)))
+                                                    (patch_size[0] * factor // subsample, patch_size[1] * factor // subsample)))
             # the "index_offsets" are offsets we add to the patch indexes
             # when combining multiple resolutions.
             index_offsets.append(index_offsets[-1] + reconstructors[-1].num_indexes)
@@ -724,7 +724,12 @@ class MultiscaleImageReconstructor(nn.Module):
           num_levels: the number of levels of resolution to process; we will drop the
               higher-resolution patches if this is less than self.num_levels.
 
-        Returns:  the reconstructed image, of shape (N, H, W, C).
+        Returns: (image, image_weight), where:
+               image: the reconstructed image, of shape (N, H, W, C).
+        image_weight: a tensor of shape (N, H, W, C) [we expand from 1 to C]
+            with values typically between about 0 and 21 in the 3-level case,
+            which may be useful (after rescaling) to visualize
+            where the patches are.
         """
         if num_levels is None:
             num_levels = self.num_levels
@@ -733,20 +738,21 @@ class MultiscaleImageReconstructor(nn.Module):
         img_weights = [ ]  # one tensor per level, shape: (N, H, W)
         def _div(x, subsample):
             return x // subsample if x is not None else None
-        for level in range(self.num_levels - num_levels, self.num_levels):
+        for level in range(num_levels):
             s = self.subsample_factors[level]
             _img_size = (img_size[0] // s, img_size[1] // s)
             this_indexes = indexes - self.index_offsets[level]
             img, weight = self.reconstructors[level](emb, this_indexes, weights, _img_size,
                                                      _div(h_offset, s), _div(w_offset, s))
             images.append(_upsample(img, s))
-            weight = (weight ** self.weight_pow) * (self.level_scale ** -level)
+            weight = (weight ** self.weight_pow) * (self.level_scale ** level)
             img_weights.append(_upsample(weight, s))
 
         num_channels = self.default_value.numel()
         images.append(self.default_value.reshape(1, 1, 1, num_channels).expand_as(images[-1]))
         img_weights.append(torch.full((1, 1, 1, 1), self.eps, device=emb.device).expand_as(img_weights[-1]))
 
+        # TODO: remove debug code.
         print("mean of img_weights is: ", [ x.mean().item() for x in img_weights ] )
         print("std of img is: ", [ x.std().item() for x in images ] )
 
@@ -754,12 +760,12 @@ class MultiscaleImageReconstructor(nn.Module):
         img_weight = torch.stack(img_weights, dim=0).sum(dim=0)
         img = weighted_img / img_weight
         print("std of final img is: ", img.std())
-        return img
+        return img, img_weight.expand_as(img)
 
 
 def _test_sort_numbers():
     num_channels = 128
-    model = Subset(num_channels=num_channels, noise_bias=False)
+    model = SubsetEmbeddings(num_channels=num_channels, noise_bias=False)
     model.train()
     optim = torch.optim.Adam(model.parameters(), lr=2e-04)
 
@@ -859,6 +865,10 @@ def _init_default(m):  # used in testing.
         elif isinstance(m, MultiscaleImageReconstructor):
             for n in m.reconstructors:
                 _init_default(n)
+        else:
+            for n in m.modules():
+                if n is not m:
+                    _init_default(n)
 
 
 def _test_patch_extractor_reconstructor():
@@ -878,7 +888,6 @@ def _test_patch_extractor_reconstructor():
     y, indexes = m(x)
     assert y.shape == (batch_size, (img_size[0]*img_size[1])//(patch_size[0]*patch_size[1]),
                        num_channels)
-    print("patch_extractor: indexes = ", indexes)
 
     h_offset = patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
     w_offset = patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
@@ -887,7 +896,6 @@ def _test_patch_extractor_reconstructor():
     weights = torch.ones(*indexes.shape)
     assert y.shape == (batch_size, (img_size[0]*img_size[1])//(patch_size[0]*patch_size[1]),
                        num_channels)
-    print("patch_extractor[offset]: indexes = ", indexes)
 
     for support_out_of_range in [False, True]:
         # nothing is out of range so should be OK in either case.
@@ -914,18 +922,15 @@ def _test_multiscale():
     x = torch.randn(batch_size, *img_size, img_channels)
     y, indexes = m(x)
 
-    print("patch_extractor: indexes = ", indexes)
 
-    h_offset = patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
-    w_offset = patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
+    h_offset = m.largest_patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
+    w_offset = m.largest_patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
 
     y, indexes = m(x, h_offset, w_offset)
     weights = torch.ones(*indexes.shape)
 
-    print("patch_extractor[offset]: indexes = ", indexes)
-
     # nothing is out of range so should be OK in either case.
-    x_recon = r(y, indexes, weights, img_size, h_offset, w_offset)
+    x_recon, recon_weights = r(y, indexes, weights, img_size, h_offset, w_offset)
     # it's inexact for a few reasons, including the "backoff" mechanism for unseen patches
     # and loss of resolution in the lowest-resolution patches.
     cosine = (x_recon * x).sum() / ((x_recon ** 2).sum() * (x ** 2).sum()).sqrt()
@@ -943,15 +948,16 @@ def _test_get_child_indexes():
     m = MultiscalePatchExtractor(img_channels, num_channels, max_size, patch_size,
                                  num_levels)
     _init_default(m)
-    r = MultiscaleImageReconstructor(img_channels, num_channels, max_size, patch_size)
+    r = MultiscaleImageReconstructor(img_channels, num_channels, max_size, patch_size,
+                                     num_levels)
     _init_default(r)
 
     batch_size = 4
-    img_size = (64, 32)
+    img_size = (8, 8)  # todo: change if we increase num_levels
     x = torch.randn(batch_size, *img_size, img_channels)
 
-    h_offset = patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
-    w_offset = patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
+    h_offset = m.largest_patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
+    w_offset = m.largest_patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
 
     y_coarse, indexes_coarse = m(x, h_offset, w_offset, num_levels=1)  # only largest patches.
 
@@ -961,13 +967,15 @@ def _test_get_child_indexes():
 
     weights = torch.ones(*indexes.shape)
 
-    print("get_child_indexes, patch_extractor[offset]: indexes = ", indexes.sort(dim=-1)[0])
+    #print("get_child_indexes, patch_extractor[offset]: indexes = ", indexes.sort(dim=-1)[0])
     if True:
         y_all, indexes_all = m(x, h_offset, w_offset)
-        print("get_child_indexes, all indexes = ", indexes_all.sort(dim=-1)[0])
+        #print("get_child_indexes, all indexes = ", indexes_all.sort(dim=-1)[0])
+        assert torch.all(indexes == indexes)
 
     # nothing is out of range so should be OK in either case.
-    x_recon = r(y, indexes, weights, img_size, h_offset, w_offset)
+    x_recon, recon_weights = r(y, indexes, weights, img_size, h_offset, w_offset)
+
     # it's inexact for a few reasons, including the "backoff" mechanism for unseen patches
     # and loss of resolution in the lowest-resolution patches.
     cosine = (x_recon * x).sum() / ((x_recon ** 2).sum() * (x ** 2).sum()).sqrt()
@@ -985,28 +993,3 @@ if __name__ == '__main__':
     _test_patch_extractor_reconstructor()
     _test_multiscale()
     _test_get_child_indexes()
-
-
-
-"""
-    Zengwei, I have something I'd like you try for me related to image recognition.  See the attached ranking.py, which will be needed.  This thing is on quite
-high priority, higher than the stu
-
-IDEA:
-  The basic idea here is to use transformers for image recognition, but both in training and inference,
-  to use a subset of the patches in the image; and also to introduce patches with multiple resolutions
-  (so the model can "back off" to lower resolutions).
-
-  The overall structure will be like MAE transformer, but with a couple extra things and some changes.
-
-  The baseline is:
-
-   embed pixels per patch -> [transformer]  -> patch embeddings
-
-  Then the patch embeddings are used as auxiliary input "src" of a transformer decoder,
-  with the pos-emb's of a target patch as the main input.
-
-
-
-
-"""
