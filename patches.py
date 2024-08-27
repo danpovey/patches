@@ -975,7 +975,7 @@ def _test_get_child_indexes():
 
     h_offset = m.largest_patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
     w_offset = m.largest_patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
-    h_offset = w_offset = torch.zeros_like(h_offset)
+    #h_offset = w_offset = torch.zeros_like(h_offset)
 
     y_coarse, indexes_coarse = m(x, h_offset, w_offset, num_levels=1)  # only largest patches.
 
