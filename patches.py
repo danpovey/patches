@@ -230,6 +230,7 @@ def _upsample(img: Tensor,
     return img.reshape(batch_size, height * u, width * u, img_channels)
 
 
+
 class AbsolutePosEmb(nn.Module):
     pass
 
@@ -280,7 +281,8 @@ class PatchExtractor(nn.Module):
         max_npatches = self.num_patches
         img_npatches = (img_height // patch_h, img_width // patch_w)
         if h_offset is not None:
-            if __name__ == '__main__' or random.random() < 0.01:
+            #if __name__ == '__main__' or random.random() < 0.01:
+            if True:  # TODO: restore condition.
                 assert torch.all(h_offset % patch_h == 0)
                 assert torch.all(w_offset % patch_w == 0)
             h_offset = h_offset // patch_h
@@ -393,12 +395,14 @@ class ImageReconstructor(nn.Module):
         (patch_h, patch_w) = self.patch_size
         (max_h, max_w) = self.max_size
         (img_h, img_w) = img_size
+        assert img_h % patch_h == 0 and img_w % patch_w == 0
         max_npatches = (max_h // patch_h, max_w // patch_w)
         img_npatches = (img_h // patch_h, img_w // patch_w)
         batch_size = emb.shape[0]
 
         if h_offset is not None:
-            if __name__ == '__main__' or random.random() < 0.01:
+            #if __name__ == '__main__' or random.random() < 0.01:
+            if True: # TODO: restore condition.
                 assert torch.all(h_offset % patch_h == 0)
                 assert torch.all(w_offset % patch_w == 0)
             h_offset = h_offset // patch_h
@@ -594,8 +598,6 @@ class MultiscalePatchExtractor(nn.Module):
            num_indexes2 = (1 + 4 + 16) * num_indexes = 21 * num_indexes.  The returned
            indexes could, for example, be passed to self.forward_indexes().  The order
            of the returned indexes is
-
-
         """
         (batch_size, num_indexes_in) = indexes.shape
         # all_indexes will contain all the indexes of each level, from coarse to
@@ -603,8 +605,9 @@ class MultiscalePatchExtractor(nn.Module):
         # them.
         all_indexes = [ indexes ]
         # prev_indexes: (batch_size, num_indexes_in, 1); will always be: (batch_size, _, 1)
-        prev_indexes = combined_indexes = indexes.unsqueeze(-1)
+        prev_indexes = indexes.unsqueeze(-1) # - self.index_offsets[0]... this subtracts zero so don't bother
         for level in range(1, self.num_levels):  # e.g. (1, 2) if num_levels == 3.
+            prev_npatches = self.extractors[level - 1].num_patches
             this_npatches = self.extractors[level].num_patches
             # 'this_offsets' give the index offsets of the 4 patches in a 2x2 square, from the top-left
             # patch of the square.  this_npatches[1] is the width of the template image at this level;
@@ -613,9 +616,16 @@ class MultiscalePatchExtractor(nn.Module):
             # the '* 2' reflects that all the x and y patch locations, and the width,
             # are twice larger each time we increase the resolution, so all terms in the
             # equation for position get multiplied by 2.
-            this_indexes = self.index_offsets[level] + (prev_indexes - self.index_offsets[level - 1]) * 2  # (batch_size, _, 1)
+
+            this_indexes = prev_indexes
+            this_height_term = (this_indexes // prev_npatches[1]) * prev_npatches[1]
+            # the term corresponding to the horizontal offsets get multiplied by 2 (this is one term in: this_indexes * 2),
+            # but the term corresponding to the vertical offsets gets multiplied by 4 because both the vertical
+            # index is twice larger, as there is more resolution, but the "* current-width" term is also twice
+            # larger.  The two terms in the parenthesis each contribute 2 to this factor of 4.
+            this_indexes = (this_indexes + this_height_term) * 2
             this_indexes = (this_indexes.unsqueeze(-1) + this_offsets) # (batch_size, _, 4)
-            all_indexes.append(this_indexes)
+            all_indexes.append(this_indexes + self.index_offsets[level])
             prev_indexes = this_indexes.reshape(batch_size, -1, 1)
 
         # intersperse the indexes.
@@ -700,7 +710,7 @@ class MultiscaleImageReconstructor(nn.Module):
                 img_size: Tuple[int, int],
                 h_offset: Optional[Tensor] = None,
                 w_offset: Optional[Tensor] = None,
-                num_levels: int = None) -> Tensor:
+                num_levels: int = None) -> Tuple[Tensor, Tensor]:
         """
         Reconstructs the image from embeddings of patches.
 
@@ -726,7 +736,7 @@ class MultiscaleImageReconstructor(nn.Module):
 
         Returns: (image, image_weight), where:
                image: the reconstructed image, of shape (N, H, W, C).
-        image_weight: a tensor of shape (N, H, W, C) [we expand from 1 to C]
+        image_weight: a tensor of shape (N, H, W, 1)
             with values typically between about 0 and 21 in the 3-level case,
             which may be useful (after rescaling) to visualize
             where the patches are.
@@ -760,10 +770,11 @@ class MultiscaleImageReconstructor(nn.Module):
         img_weight = torch.stack(img_weights, dim=0).sum(dim=0)
         img = weighted_img / img_weight
         print("std of final img is: ", img.std())
-        return img, img_weight.expand_as(img)
+        return img, img_weight
 
 
 def _test_sort_numbers():
+    print("TEST_SORT_NUMBERS")
     num_channels = 128
     model = SubsetEmbeddings(num_channels=num_channels, noise_bias=False)
     model.train()
@@ -804,6 +815,7 @@ def _test_sort_numbers():
 
 
 def _test_patchify():
+    print("TEST_PATCHIFY")
     x = torch.randn(10, 64, 32, 3)
     patch_size = (4, 8)
     emb = _patchify(x, patch_size)
@@ -812,6 +824,7 @@ def _test_patchify():
 
 
 def _test_get_patch_indexes():
+    print("TEST_GET_PATCH_INDEXES")
     if True:
         y = _get_patch_indexes((2, 4), (2, 4), 1, None, None, torch.device('cpu'))
         print("y = ", y)
@@ -830,6 +843,7 @@ def _test_get_patch_indexes():
 
 
 def _test_get_relative_indexes():
+    print("TEST_GET_RELATIVE_INDEXES")
     if True:
         available = torch.tensor( [ [ 0, 1, 2, 3 ],
                                     [ 4, 5, 6, 7 ] ] )
@@ -872,6 +886,7 @@ def _init_default(m):  # used in testing.
 
 
 def _test_patch_extractor_reconstructor():
+    print("TEST_PATCH_EXTRACTOR_RECONSTRUCTOR")
     img_channels = 3
     num_channels = 256
     max_size = (512, 512)
@@ -905,6 +920,7 @@ def _test_patch_extractor_reconstructor():
 
 
 def _test_multiscale():
+    print("TEST_MULTISCALE")
     img_channels = 3
     num_channels = 256
     max_size = (512, 512)
@@ -939,11 +955,12 @@ def _test_multiscale():
 
 
 def _test_get_child_indexes():
+    print("TEST_GET_CHILD_INDEXES")
     img_channels = 3
     num_channels = 256
-    max_size = (512, 512)
-    patch_size = (4, 4)
-    num_levels = 2
+    max_size = (256, 512)
+    patch_size = (4, 2)
+    num_levels = 3
 
     m = MultiscalePatchExtractor(img_channels, num_channels, max_size, patch_size,
                                  num_levels)
@@ -953,11 +970,12 @@ def _test_get_child_indexes():
     _init_default(r)
 
     batch_size = 4
-    img_size = (8, 8)  # todo: change if we increase num_levels
+    img_size = (16, 16)  # todo: change if we increase num_levels
     x = torch.randn(batch_size, *img_size, img_channels)
 
     h_offset = m.largest_patch_size[0] * torch.tensor([ 0, 7, 5, 3 ] )
     w_offset = m.largest_patch_size[1] * torch.tensor([ 10, 11, 9, 0 ] )
+    h_offset = w_offset = torch.zeros_like(h_offset)
 
     y_coarse, indexes_coarse = m(x, h_offset, w_offset, num_levels=1)  # only largest patches.
 
@@ -967,11 +985,13 @@ def _test_get_child_indexes():
 
     weights = torch.ones(*indexes.shape)
 
+    #print("get_child_indexes, patch_extractor[offset]: indexes-unsorted = ", indexes)
     #print("get_child_indexes, patch_extractor[offset]: indexes = ", indexes.sort(dim=-1)[0])
     if True:
         y_all, indexes_all = m(x, h_offset, w_offset)
+        #print("get_child_indexes, all indexes-unsorted = ", indexes_all)
         #print("get_child_indexes, all indexes = ", indexes_all.sort(dim=-1)[0])
-        assert torch.all(indexes == indexes)
+        assert torch.all(indexes.sort(dim=-1)[0] == indexes_all.sort(dim=-1)[0])
 
     # nothing is out of range so should be OK in either case.
     x_recon, recon_weights = r(y, indexes, weights, img_size, h_offset, w_offset)
